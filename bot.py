@@ -4,10 +4,15 @@ import asyncio
 import tempfile
 import shutil
 import logging
+import shlex
+import subprocess
+from pathlib import Path
+
 from pyrogram import Client, filters
-from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup, CallbackQuery
 from pyromod import listen
 from yt_dlp import YoutubeDL
+
 from web import run_web
 import aiohttp
 from aiohttp import ClientTimeout
@@ -16,318 +21,395 @@ from aiohttp import ClientTimeout
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("ytbot")
 
-# --- Environment / secrets (set these in Render dashboard) ---
+# --- Environment / secrets (Render dashboard me set karna hota hai) ---
 API_ID = int(os.getenv("API_ID", "0"))
 API_HASH = os.getenv("API_HASH", "")
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
-OWNER_ID = int(os.getenv("OWNER_ID", "0"))  # required
-# Optional: comma separated sudo users
-SUDO_USERS_ENV = os.getenv("SUDO_USERS", "")  # e.g. "12345,67890"
+OWNER_ID = int(os.getenv("OWNER_ID", "0"))
+
+SUDO_ENV = os.getenv("SUDO_USERS", "")
 PORT = int(os.getenv("PORT", 10000))
 
-# Convert SUDO_USERS to list[int]
 SUDO_USERS = []
-if SUDO_USERS_ENV:
-    for v in SUDO_USERS_ENV.split(","):
+if SUDO_ENV:
+    for v in SUDO_ENV.split(","):
         try:
-            uid = int(v.strip())
-            if uid:
-                SUDO_USERS.append(uid)
+            SUDO_USERS.append(int(v.strip()))
         except:
             pass
-
 SUDO_USERS = list(set(SUDO_USERS + [OWNER_ID]))
 
-# Default image for /start
-DEFAULT_IMG = os.getenv("DEFAULT_IMG", "https://graph.org/file/5ed50675df0faf833efef-e102210eb72c1d5a17.jpg")
+DEFAULT_IMG = os.getenv(
+    "DEFAULT_IMG",
+    "https://graph.org/file/5ed50675df0faf833efef-e102210eb72c1d5a17.jpg"
+)
 
-# Temp folder
 TMP_DIR = tempfile.mkdtemp(prefix="ytbot_")
-logger.info("Temp dir: %s", TMP_DIR)
+logger.info("TMP DIR: %s", TMP_DIR)
 
-# --- Helper: authorization ---
-def is_authorized(user_id: int) -> bool:
-    return user_id in SUDO_USERS
+# Quality settings
+RESOLUTIONS = [144,240,360,480,720,1080]
+PENDING_QUALITY = {}
+MAX_VIDEO_BYTES = 50 * 1024 * 1024   # 50 MB
 
-# --- Helper: send image by url or upload fallback (uses aiohttp) ---
-async def send_photo_via_url_or_upload(bot, chat_id, url, caption=None, reply_markup=None, max_bytes=10_000_000):
-    logger.info("Attempt send image url: %s", url)
+
+# ---------------- AUTH ----------------
+def is_authorized(uid: int) -> bool:
+    return uid in SUDO_USERS
+
+
+# ---------------- IMAGE SENDER ----------------
+async def send_photo_via_url_or_upload(bot, chat_id, url, caption=None, reply_markup=None):
+    logger.info("Attempting image: %s", url)
     try:
-        # Try direct first (pyrogram will fetch remote URL)
-        await bot.send_photo(chat_id=chat_id, photo=url, caption=caption, reply_markup=reply_markup)
-        return
-    except Exception as e:
-        logger.warning("Direct send failed, will fallback. err=%s", e)
+        return await bot.send_photo(chat_id, url, caption=caption, reply_markup=reply_markup)
+    except:
+        pass
 
-    tmp_path = None
     timeout = aiohttp.ClientTimeout(total=20)
+    tmp_path = os.path.join(TMP_DIR, "tmp.jpg")
     try:
         async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.get(url, allow_redirects=True) as resp:
-                logger.info("Downloaded %s -> status %s", url, resp.status)
+            async with session.get(url) as resp:
                 if resp.status != 200:
-                    logger.warning("Primary URL returned %s, trying default image", resp.status)
-                    if url != DEFAULT_IMG:
-                        await send_photo_via_url_or_upload(bot, chat_id, DEFAULT_IMG, caption=caption, reply_markup=reply_markup)
-                    else:
-                        await bot.send_message(chat_id, f"Image fetch failed (HTTP {resp.status})")
-                    return
-
-                ctype = (resp.headers.get("content-type") or "").lower()
-                if not ctype.startswith("image"):
-                    logger.warning("Not an image: %s", ctype)
-                    await bot.send_message(chat_id, f"URL did not return an image (content-type: {ctype}).")
-                    return
-
-                tmp_path = os.path.join(TMP_DIR, "tmp_image")
+                    return await bot.send_message(chat_id, "Image failed.")
+                data = await resp.read()
                 with open(tmp_path, "wb") as f:
-                    data = await resp.read()
                     f.write(data)
-
-                await bot.send_photo(chat_id=chat_id, photo=tmp_path, caption=caption, reply_markup=reply_markup)
-                return
-    except Exception as e:
-        logger.exception("Error downloading image fallback: %s", e)
+        await bot.send_photo(chat_id, tmp_path, caption=caption, reply_markup=reply_markup)
+    except Exception:
+        await bot.send_message(chat_id, "Image fetch error.")
     finally:
-        try:
-            if tmp_path and os.path.exists(tmp_path):
-                os.remove(tmp_path)
-        except:
-            pass
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
 
-# --- YT Download helpers ---
-def download_video_with_ydl(url: str, outdir: str, fmt: str = "best"):
+
+# --------------- QUALITY BUTTON UI -----------------
+def quality_keyboard():
+    rows = []
+    row = []
+    for i, r in enumerate(RESOLUTIONS, 1):
+        row.append(InlineKeyboardButton(str(r), callback_data=f"res:{r}"))
+        if i % 3 == 0:
+            rows.append(row); row = []
+    if row:
+        rows.append(row)
+    return InlineKeyboardMarkup(rows)
+
+
+@app.on_callback_query()
+async def callback_handler(cli: Client, cq: CallbackQuery):
+    data = cq.data or ""
+    if data.startswith("res:"):
+        h = int(data.split(":")[1])
+        fut = PENDING_QUALITY.get(cq.message.chat.id)
+        if fut and not fut.done():
+            fut.set_result(h)
+        await cq.answer(f"Selected {h}p")
+    else:
+        await cq.answer()
+
+
+# ---------------- FAST RE-ENCODE ----------------
+def reencode_to_target_size_singlepass(src: str, dst: str, target_bytes: int, audio_kbps=64) -> str:
+    try:
+        cmd = (
+            f"ffprobe -v error -show_entries format=duration "
+            f"-of default=noprint_wrappers=1:nokey=1 {shlex.quote(src)}"
+        )
+        dur = float(subprocess.check_output(cmd, shell=True).decode().strip())
+    except:
+        # fallback crf encode
+        cmd = (
+            f"ffmpeg -y -i {shlex.quote(src)} -c:v libx264 "
+            f"-preset veryfast -crf 28 -c:a aac -b:a {audio_kbps}k {shlex.quote(dst)}"
+        )
+        subprocess.check_call(cmd, shell=True)
+        return dst
+
+    audio_bps = audio_kbps * 1000
+    audio_bytes = (audio_bps/8) * dur
+    video_bytes_target = max(target_bytes - audio_bytes, 150000)
+    video_kbps = int((video_bytes_target*8/dur)/1000)
+    if video_kbps < 100: video_kbps = 100
+    if video_kbps > 5000: video_kbps = 5000
+
+    cmd = (
+        f"ffmpeg -y -i {shlex.quote(src)} -c:v libx264 -b:v {video_kbps}k "
+        f"-preset veryfast -c:a aac -b:a {audio_kbps}k {shlex.quote(dst)}"
+    )
+    subprocess.check_call(cmd, shell=True)
+    return dst
+
+
+# ---------------- YOUTUBE DOWNLOAD (QUALITY-SELECTED) ----------------
+def download_video_with_ydl(url: str, outdir: str, req_height: int=None):
     outtmpl = os.path.join(outdir, "%(title)s.%(ext)s")
 
-    ydl_opts = {
-        "format": fmt,
+    base = {
         "outtmpl": outtmpl,
         "noplaylist": True,
         "quiet": True,
         "no_warnings": True,
     }
 
-    # Add cookies if available
-    cookies_path = os.getenv("COOKIES_FILE_PATH")
-    if cookies_path and os.path.exists(cookies_path):
-        ydl_opts["cookiefile"] = cookies_path
-        logger.info(f"Using cookies file: {cookies_path}")
-    else:
-        logger.warning("No cookies file found; login-required videos may fail.")
+    cookies = os.getenv("COOKIES_FILE_PATH")
+    if cookies and os.path.exists(cookies):
+        base["cookiefile"] = cookies
+        logger.info("Using cookies...")
 
-    with YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(url, download=True)
-
-        ext = info.get("ext") or "mp4"
-        title = info.get("title") or "video"
-        filename = os.path.join(outdir, f"{title}.{ext}")
-
-        possible = info.get("_filename")
-        if possible and os.path.exists(possible):
-            return possible
-
-        if os.path.exists(filename):
-            return filename
-
+    def finalize(info):
+        f1 = info.get("_filename")
+        if f1 and os.path.exists(f1):
+            return f1, info
+        ext = info.get("ext","mp4")
+        title = info.get("title","video")
+        p = os.path.join(outdir, f"{title}.{ext}")
+        if os.path.exists(p):
+            return p, info
+        # fallback
         files = sorted(
-            [os.path.join(outdir, f) for f in os.listdir(outdir)],
-            key=os.path.getmtime,
-            reverse=True
+            [os.path.join(outdir,f) for f in os.listdir(outdir)],
+            key=os.path.getmtime, reverse=True
         )
-        if files:
-            return files[0]
+        if files: return files[0], info
+        raise FileNotFoundError("No downloaded file found.")
 
-        raise FileNotFoundError("Downloaded file not found.")
+    def run(opts):
+        with YoutubeDL(opts) as y:
+            return y.extract_info(url, download=True)
 
+    # 1) try progressive
+    if req_height:
+        f1 = f"best[height<={req_height}]"
+        try:
+            info = run({**base,"format":f1})
+            return finalize(info)
+        except Exception as e:
+            logger.warning("Progressive failed: %s", e)
+
+    # 2) try adaptive merge
+    if req_height:
+        f2 = f"bestvideo[height<={req_height}]+bestaudio/best"
+        try:
+            info = run({**base,"format":f2})
+            return finalize(info)
+        except Exception as e:
+            logger.warning("Adaptive failed: %s", e)
+
+    # 3) best
+    try:
+        info = run({**base,"format":"best"})
+        return finalize(info)
+    except Exception as e:
+        logger.warning("Best failed: %s", e)
+
+    raise RuntimeError("No suitable format available.")
+
+
+# ---------------- PLAYLIST EXTRACT ----------------
 def extract_playlist_items(url: str):
-    ydl_opts = {"quiet": True, "extract_flat": True}
-    with YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(url, download=False)
+    with YoutubeDL({"quiet":True,"extract_flat":True}) as y:
+        info = y.extract_info(url, download=False)
         if "entries" in info:
-            items = info["entries"]
-            # items may contain 'url' or 'id'
-            videos = []
-            for e in items:
-                # create full video url
+            vids=[]
+            for e in info["entries"]:
                 vid = e.get("id") or e.get("url")
-                if not vid:
-                    continue
-                videos.append(f"https://www.youtube.com/watch?v={vid}")
-            return videos
-        else:
-            # Not a playlist
-            return [url]
+                if vid:
+                    vids.append(f"https://www.youtube.com/watch?v={vid}")
+            return vids
+        return [url]
 
-# --- Bot startup ---
+
+# ---------------- BOT ----------------
 app = Client("ytbot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
-# Buttons
-start_buttons = InlineKeyboardMarkup(
-    [
-        [InlineKeyboardButton("Help", callback_data="help")],
-        [InlineKeyboardButton("Owner", url=f"https://t.me/{os.getenv('OWNER_USERNAME','')}")] if os.getenv("OWNER_USERNAME") else []
-    ]
-)
 
-# --- Handlers ---
+# /start
 @app.on_message(filters.command("start"))
-async def cmd_start(cli, msg):
-    uid = msg.from_user.id if msg.from_user else None
-    caption = "HELLO 👋\nI am your private YT downloader bot.\nSend /help to see commands.\n\nCreated by @BLACKRHINO360"
-    await send_photo_via_url_or_upload(cli, msg.chat.id, DEFAULT_IMG, caption=caption, reply_markup=start_buttons)
+async def start_handler(cli, msg):
+    caption = "👋 **Private YT Downloader Bot**\n\n✔ Single Video\n✔ Playlists\n✔ Quality Select (144–1080)\n✔ >50MB videos as VIDEO\n\nCreated by @BLACKRHINO360"
+    await send_photo_via_url_or_upload(cli, msg.chat.id, DEFAULT_IMG, caption, None)
 
+
+# /help
 @app.on_message(filters.command("help"))
-async def cmd_help(cli, msg):
-    text = """
-Available commands:
-/start - Start & info
-/help - This help
-/ytvid - Download single YouTube video (interactive)
-/ytpl  - Download playlist (interactive)
-Note: Bot is private. Only owner / sudo users can use heavy commands.
-Created by @BLACKRHINO360
-"""
+async def help_handler(cli, msg):
+    text = (
+        "**Commands**\n"
+        "/ytvid – Single video\n"
+        "/ytpl – Playlist\n"
+        "/sudo add <id>\n"
+        "/sudo remove <id>\n"
+        "\nCreated by @BLACKRHINO360"
+    )
     await msg.reply_text(text)
 
-# Interactive: single video
+
+# ---------------- YT VID ----------------
 @app.on_message(filters.command("ytvid"))
-async def cmd_ytvid(cli, msg):
-    uid = msg.from_user.id if msg.from_user else None
-    if not is_authorized(uid):
-        return await msg.reply_text("🚫 You are not authorized to use this bot.")
-    try:
-        await msg.reply_text("Send the YouTube video URL now (or paste).")
-        # wait for user response
-        m = await app.listen(msg.chat.id, timeout=60)
-        url = m.text.strip()
-        await msg.reply_text("Which quality? Example: best, best[height<=720]. Send `best` to keep default.")
-        qmsg = await app.listen(msg.chat.id, timeout=30)
-        quality = qmsg.text.strip() if (qmsg and qmsg.text) else "best"
-    except Exception as e:
-        await msg.reply_text("Timeout or error: " + str(e))
-        return
+async def ytvid_handler(cli, msg):
+    if not is_authorized(msg.from_user.id):
+        return await msg.reply_text("🚫 Unauthorized.")
 
-    m2 = await msg.reply_text("Downloading... This may take a while.")
+    await msg.reply_text("🎬 Send YouTube video link:")
+    m = await app.listen(msg.chat.id, timeout=180)
+    url = m.text.strip()
+
+    fut = asyncio.get_event_loop().create_future()
+    PENDING_QUALITY[msg.chat.id] = fut
+    await msg.reply_text("Select quality:", reply_markup=quality_keyboard())
+
     try:
-        out = download_video_with_ydl(url, TMP_DIR, fmt=quality)
-        # send file
-        basename = os.path.basename(out)
-        filesize = os.path.getsize(out)
-        if filesize > 50 * 1024 * 1024:
-            # >50MB send as document (Telegram may still limit). For big files Render may fail.
-            await msg.reply_document(document=out, caption=f"Downloaded: {basename}")
-        else:
-            await msg.reply_video(video=out, caption=f"Downloaded: {basename}")
-    except Exception as e:
-        logger.exception("Download failed: %s", e)
-        await msg.reply_text("Download failed: " + str(e))
+        req_height = await asyncio.wait_for(fut, timeout=60)
+    except:
+        return await msg.reply_text("No quality selected.")
     finally:
-        try:
-            if os.path.exists(out):
-                os.remove(out)
-        except:
-            pass
-        await m2.delete()
+        PENDING_QUALITY.pop(msg.chat.id, None)
 
-# Interactive: playlist
-@app.on_message(filters.command("ytpl"))
-async def cmd_ytpl(cli, msg):
-    uid = msg.from_user.id if msg.from_user else None
-    if not is_authorized(uid):
-        return await msg.reply_text("🚫 You are not authorized to use this bot.")
+    info_msg = await msg.reply_text("⏳ Downloading...")
     try:
-        await msg.reply_text("Send the YouTube playlist URL now.")
-        m = await app.listen(msg.chat.id, timeout=60)
-        url = m.text.strip()
-        await msg.reply_text("Which quality for videos? Example: best, best[height<=720]. Send `best` to keep default.")
-        qmsg = await app.listen(msg.chat.id, timeout=30)
-        quality = qmsg.text.strip() if (qmsg and qmsg.text) else "best"
+        file_path, info = await asyncio.to_thread(download_video_with_ydl, url, TMP_DIR, req_height)
     except Exception as e:
-        await msg.reply_text("Timeout or error: " + str(e))
-        return
+        return await info_msg.edit_text("❌ Download failed: " + str(e))
 
-    status_msg = await msg.reply_text("Fetching playlist...")
+    # re-encode if >50MB
+    try:
+        size = os.path.getsize(file_path)
+        if size > MAX_VIDEO_BYTES:
+            await info_msg.edit_text("Video >50MB — reencoding...")
+            dst = str(Path(file_path).with_name(Path(file_path).stem+"_small.mp4"))
+            try:
+                await asyncio.to_thread(reencode_to_target_size_singlepass, file_path, dst, MAX_VIDEO_BYTES-1024*1024)
+                send_path = dst
+            except Exception as e:
+                send_path = file_path
+        else:
+            send_path = file_path
+
+        await msg.reply_video(send_path, caption=info.get("title",""))
+    except:
+        await msg.reply_text("Failed to send video.")
+    finally:
+        try: os.remove(file_path)
+        except: pass
+        try:
+            if 'dst' in locals() and os.path.exists(dst):
+                os.remove(dst)
+        except: pass
+        await info_msg.delete()
+
+
+# ---------------- YT PLAYLIST ----------------
+@app.on_message(filters.command("ytpl"))
+async def ytpl_handler(cli, msg):
+    if not is_authorized(msg.from_user.id):
+        return await msg.reply_text("🚫 Unauthorized.")
+
+    await msg.reply_text("📄 Send playlist link:")
+    m = await app.listen(msg.chat.id, timeout=180)
+    url = m.text.strip()
+
+    fut = asyncio.get_event_loop().create_future()
+    PENDING_QUALITY[msg.chat.id] = fut
+    await msg.reply_text("Select quality:", reply_markup=quality_keyboard())
+
+    try:
+        req_height = await asyncio.wait_for(fut, timeout=60)
+    except:
+        return await msg.reply_text("No quality selected.")
+    finally:
+        PENDING_QUALITY.pop(msg.chat.id, None)
+
+    status = await msg.reply_text("⏳ Fetching playlist...")
     try:
         videos = extract_playlist_items(url)
-        await status_msg.edit_text(f"Found {len(videos)} videos. Starting download one by one (this will take time).")
-        counter = 0
-        for vurl in videos:
-            counter += 1
-            try:
-                s = await msg.reply_text(f"[{counter}/{len(videos)}] Downloading...")
-                out = download_video_with_ydl(vurl, TMP_DIR, fmt=quality)
-                basename = os.path.basename(out)
-                filesize = os.path.getsize(out)
-                if filesize > 50 * 1024 * 1024:
-                    await msg.reply_document(document=out, caption=f"{counter}/{len(videos)} {basename}")
-                else:
-                    await msg.reply_video(video=out, caption=f"{counter}/{len(videos)} {basename}")
-                try:
-                    os.remove(out)
-                except:
-                    pass
-                await s.delete()
-            except Exception as e:
-                await msg.reply_text(f"Failed for video {vurl}: {e}")
-        await status_msg.edit_text("Playlist processing finished.")
     except Exception as e:
-        logger.exception("Playlist failed: %s", e)
-        await status_msg.edit_text("Playlist failed: " + str(e))
+        return await status.edit_text("❌ Failed: "+str(e))
 
-# /sudo add or remove owner convenience (only OWNER_ID)
+    await status.edit_text(f"Found {len(videos)} videos. Starting...")
+
+    for idx, vurl in enumerate(videos, start=1):
+        s = await msg.reply_text(f"[{idx}/{len(videos)}] Downloading...")
+        try:
+            file_path, info = await asyncio.to_thread(download_video_with_ydl, vurl, TMP_DIR, req_height)
+            size = os.path.getsize(file_path)
+
+            if size > MAX_VIDEO_BYTES:
+                dst = str(Path(file_path).with_name(Path(file_path).stem+"_small.mp4"))
+                try:
+                    await asyncio.to_thread(reencode_to_target_size_singlepass, file_path, dst, MAX_VIDEO_BYTES-1024*1024)
+                    send_path = dst
+                except:
+                    send_path = file_path
+            else:
+                send_path = file_path
+
+            await msg.reply_video(send_path, caption=f"{idx}/{len(videos)} – {info.get('title','')}")
+        except Exception as e:
+            await msg.reply_text(f"Failed ({idx}): {e}")
+        finally:
+            try: os.remove(file_path)
+            except: pass
+            try:
+                if 'dst' in locals() and os.path.exists(dst):
+                    os.remove(dst)
+            except: pass
+            await s.delete()
+            await asyncio.sleep(1)
+
+    await status.edit_text("Playlist completed ✔")
+
+
+# ---------------- SUDO ----------------
 @app.on_message(filters.command("sudo") & filters.user(OWNER_ID))
-async def cmd_sudo(cli, msg):
-    # usage: /sudo add 12345  or /sudo remove 12345
+async def sudo_handler(cli, msg):
     args = msg.text.split()
     if len(args) < 3:
-        return await msg.reply_text("Usage: /sudo add <user_id>  OR  /sudo remove <user_id>")
-    action = args[1].lower()
+        return await msg.reply_text("Use: /sudo add <id>  or  /sudo remove <id>")
+
+    action = args[1]
     try:
         uid = int(args[2])
     except:
-        return await msg.reply_text("User id must be integer.")
-    global SUDO_USERS
+        return await msg.reply_text("User ID must be number.")
+
     if action == "add":
         if uid not in SUDO_USERS:
             SUDO_USERS.append(uid)
-            await msg.reply_text(f"Added {uid} to sudo users.")
+            await msg.reply_text(f"Added {uid}.")
         else:
-            await msg.reply_text("Already present.")
+            await msg.reply_text("Already added.")
     elif action == "remove":
-        if uid in SUDO_USERS and uid != OWNER_ID:
+        if uid != OWNER_ID and uid in SUDO_USERS:
             SUDO_USERS.remove(uid)
-            await msg.reply_text(f"Removed {uid} from sudo users.")
+            await msg.reply_text(f"Removed {uid}.")
         else:
             await msg.reply_text("Cannot remove.")
     else:
-        await msg.reply_text("Unknown action. use add/remove.")
+        await msg.reply_text("Invalid action.")
 
-# --- Start both services ---
+
+
+# ---------------- MAIN START ----------------
 def start():
-    # start web server thread first
     run_web()
-    # run pyrogram client (blocking)
-    logger.info("Starting Pyrogram client...")
-    app.run()  # blocks
+    logger.info("Starting bot...")
+    app.run()
+
 
 if __name__ == "__main__":
-    # required env check
-    missing = []
-    if API_ID == 0: missing.append("API_ID")
+    missing=[]
+    if API_ID==0: missing.append("API_ID")
     if not API_HASH: missing.append("API_HASH")
     if not BOT_TOKEN: missing.append("BOT_TOKEN")
-    if OWNER_ID == 0: missing.append("OWNER_ID")
+    if OWNER_ID==0: missing.append("OWNER_ID")
+
     if missing:
-        logger.error("Missing required env vars: %s", ", ".join(missing))
-        print("Set env vars:", ", ".join(missing))
-        raise SystemExit(1)
+        print("Missing:",missing)
+        raise SystemExit
+
     try:
         start()
-    except KeyboardInterrupt:
-        logger.info("Shutting down...")
     finally:
-        try:
-            shutil.rmtree(TMP_DIR)
-        except:
-            pass
-
+        shutil.rmtree(TMP_DIR, ignore_errors=True)
