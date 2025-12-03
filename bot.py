@@ -10,18 +10,18 @@ from pathlib import Path
 
 from pyrogram import Client, filters
 from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup, CallbackQuery
+# pyromod patches Client.listen to work as expected
 from pyromod import listen
 from yt_dlp import YoutubeDL
 
 from web import run_web
 import aiohttp
-from aiohttp import ClientTimeout
 
 # Logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("ytbot")
 
-# --- Environment / secrets (Render dashboard me set karna hota hai) ---
+# --- Environment / secrets (Render dashboard me set karna) ---
 API_ID = int(os.getenv("API_ID", "0"))
 API_HASH = os.getenv("API_HASH", "")
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
@@ -48,9 +48,13 @@ TMP_DIR = tempfile.mkdtemp(prefix="ytbot_")
 logger.info("TMP DIR: %s", TMP_DIR)
 
 # Quality settings
-RESOLUTIONS = [144,240,360,480,720,1080]
+RESOLUTIONS = [144, 240, 360, 480, 720, 1080]
 PENDING_QUALITY = {}
-MAX_VIDEO_BYTES = 50 * 1024 * 1024   # 50 MB
+MAX_VIDEO_BYTES = 50 * 1024 * 1024  # 50 MB
+
+
+# --------- Create pyrogram client (MUST be before handlers) ----------
+app = Client("ytbot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
 
 # ---------------- AUTH ----------------
@@ -63,7 +67,7 @@ async def send_photo_via_url_or_upload(bot, chat_id, url, caption=None, reply_ma
     logger.info("Attempting image: %s", url)
     try:
         return await bot.send_photo(chat_id, url, caption=caption, reply_markup=reply_markup)
-    except:
+    except Exception:
         pass
 
     timeout = aiohttp.ClientTimeout(total=20)
@@ -91,17 +95,23 @@ def quality_keyboard():
     for i, r in enumerate(RESOLUTIONS, 1):
         row.append(InlineKeyboardButton(str(r), callback_data=f"res:{r}"))
         if i % 3 == 0:
-            rows.append(row); row = []
+            rows.append(row)
+            row = []
     if row:
         rows.append(row)
     return InlineKeyboardMarkup(rows)
 
 
+# Callback handler (after app created)
 @app.on_callback_query()
 async def callback_handler(cli: Client, cq: CallbackQuery):
     data = cq.data or ""
     if data.startswith("res:"):
-        h = int(data.split(":")[1])
+        try:
+            h = int(data.split(":", 1)[1])
+        except:
+            await cq.answer("Invalid")
+            return
         fut = PENDING_QUALITY.get(cq.message.chat.id)
         if fut and not fut.done():
             fut.set_result(h)
@@ -118,8 +128,8 @@ def reencode_to_target_size_singlepass(src: str, dst: str, target_bytes: int, au
             f"-of default=noprint_wrappers=1:nokey=1 {shlex.quote(src)}"
         )
         dur = float(subprocess.check_output(cmd, shell=True).decode().strip())
-    except:
-        # fallback crf encode
+    except Exception:
+        # fallback crf encode (fast)
         cmd = (
             f"ffmpeg -y -i {shlex.quote(src)} -c:v libx264 "
             f"-preset veryfast -crf 28 -c:a aac -b:a {audio_kbps}k {shlex.quote(dst)}"
@@ -128,11 +138,13 @@ def reencode_to_target_size_singlepass(src: str, dst: str, target_bytes: int, au
         return dst
 
     audio_bps = audio_kbps * 1000
-    audio_bytes = (audio_bps/8) * dur
+    audio_bytes = (audio_bps / 8) * dur
     video_bytes_target = max(target_bytes - audio_bytes, 150000)
-    video_kbps = int((video_bytes_target*8/dur)/1000)
-    if video_kbps < 100: video_kbps = 100
-    if video_kbps > 5000: video_kbps = 5000
+    video_kbps = int((video_bytes_target * 8 / dur) / 1000)
+    if video_kbps < 100:
+        video_kbps = 100
+    if video_kbps > 5000:
+        video_kbps = 5000
 
     cmd = (
         f"ffmpeg -y -i {shlex.quote(src)} -c:v libx264 -b:v {video_kbps}k "
@@ -143,7 +155,7 @@ def reencode_to_target_size_singlepass(src: str, dst: str, target_bytes: int, au
 
 
 # ---------------- YOUTUBE DOWNLOAD (QUALITY-SELECTED) ----------------
-def download_video_with_ydl(url: str, outdir: str, req_height: int=None):
+def download_video_with_ydl(url: str, outdir: str, req_height: int = None):
     outtmpl = os.path.join(outdir, "%(title)s.%(ext)s")
 
     base = {
@@ -156,23 +168,24 @@ def download_video_with_ydl(url: str, outdir: str, req_height: int=None):
     cookies = os.getenv("COOKIES_FILE_PATH")
     if cookies and os.path.exists(cookies):
         base["cookiefile"] = cookies
-        logger.info("Using cookies...")
+        logger.info("Using cookies file for yt-dlp")
 
     def finalize(info):
         f1 = info.get("_filename")
         if f1 and os.path.exists(f1):
             return f1, info
-        ext = info.get("ext","mp4")
-        title = info.get("title","video")
+        ext = info.get("ext", "mp4")
+        title = info.get("title", "video")
         p = os.path.join(outdir, f"{title}.{ext}")
         if os.path.exists(p):
             return p, info
-        # fallback
         files = sorted(
-            [os.path.join(outdir,f) for f in os.listdir(outdir)],
-            key=os.path.getmtime, reverse=True
+            [os.path.join(outdir, f) for f in os.listdir(outdir)],
+            key=os.path.getmtime,
+            reverse=True,
         )
-        if files: return files[0], info
+        if files:
+            return files[0], info
         raise FileNotFoundError("No downloaded file found.")
 
     def run(opts):
@@ -183,23 +196,23 @@ def download_video_with_ydl(url: str, outdir: str, req_height: int=None):
     if req_height:
         f1 = f"best[height<={req_height}]"
         try:
-            info = run({**base,"format":f1})
+            info = run({**base, "format": f1})
             return finalize(info)
         except Exception as e:
             logger.warning("Progressive failed: %s", e)
 
-    # 2) try adaptive merge
+    # 2) try adaptive merge (video+audio)
     if req_height:
         f2 = f"bestvideo[height<={req_height}]+bestaudio/best"
         try:
-            info = run({**base,"format":f2})
+            info = run({**base, "format": f2})
             return finalize(info)
         except Exception as e:
             logger.warning("Adaptive failed: %s", e)
 
-    # 3) best
+    # 3) try best
     try:
-        info = run({**base,"format":"best"})
+        info = run({**base, "format": "best"})
         return finalize(info)
     except Exception as e:
         logger.warning("Best failed: %s", e)
@@ -209,10 +222,10 @@ def download_video_with_ydl(url: str, outdir: str, req_height: int=None):
 
 # ---------------- PLAYLIST EXTRACT ----------------
 def extract_playlist_items(url: str):
-    with YoutubeDL({"quiet":True,"extract_flat":True}) as y:
+    with YoutubeDL({"quiet": True, "extract_flat": True}) as y:
         info = y.extract_info(url, download=False)
         if "entries" in info:
-            vids=[]
+            vids = []
             for e in info["entries"]:
                 vid = e.get("id") or e.get("url")
                 if vid:
@@ -221,14 +234,16 @@ def extract_playlist_items(url: str):
         return [url]
 
 
-# ---------------- BOT ----------------
-app = Client("ytbot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
-
+# ---------------- BOT HANDLERS ----------------
 
 # /start
 @app.on_message(filters.command("start"))
 async def start_handler(cli, msg):
-    caption = "👋 **Private YT Downloader Bot**\n\n✔ Single Video\n✔ Playlists\n✔ Quality Select (144–1080)\n✔ >50MB videos as VIDEO\n\nCreated by @BLACKRHINO360"
+    caption = (
+        "👋 **Private YT Downloader Bot**\n\n"
+        "✔ Single Video\n✔ Playlists\n✔ Quality Select (144–1080)\n✔ >50MB videos as VIDEO\n\n"
+        "Created by @BLACKRHINO360"
+    )
     await send_photo_via_url_or_upload(cli, msg.chat.id, DEFAULT_IMG, caption, None)
 
 
@@ -240,8 +255,8 @@ async def help_handler(cli, msg):
         "/ytvid – Single video\n"
         "/ytpl – Playlist\n"
         "/sudo add <id>\n"
-        "/sudo remove <id>\n"
-        "\nCreated by @BLACKRHINO360"
+        "/sudo remove <id>\n\n"
+        "Created by @BLACKRHINO360"
     )
     await msg.reply_text(text)
 
@@ -249,11 +264,14 @@ async def help_handler(cli, msg):
 # ---------------- YT VID ----------------
 @app.on_message(filters.command("ytvid"))
 async def ytvid_handler(cli, msg):
-    if not is_authorized(msg.from_user.id):
+    uid = msg.from_user.id if msg.from_user else None
+    if not is_authorized(uid):
         return await msg.reply_text("🚫 Unauthorized.")
 
     await msg.reply_text("🎬 Send YouTube video link:")
     m = await app.listen(msg.chat.id, timeout=180)
+    if not m or not getattr(m, "text", None):
+        return await msg.reply_text("No link received. Cancelled.")
     url = m.text.strip()
 
     fut = asyncio.get_event_loop().create_future()
@@ -262,7 +280,8 @@ async def ytvid_handler(cli, msg):
 
     try:
         req_height = await asyncio.wait_for(fut, timeout=60)
-    except:
+    except Exception:
+        PENDING_QUALITY.pop(msg.chat.id, None)
         return await msg.reply_text("No quality selected.")
     finally:
         PENDING_QUALITY.pop(msg.chat.id, None)
@@ -271,43 +290,51 @@ async def ytvid_handler(cli, msg):
     try:
         file_path, info = await asyncio.to_thread(download_video_with_ydl, url, TMP_DIR, req_height)
     except Exception as e:
-        return await info_msg.edit_text("❌ Download failed: " + str(e))
+        await info_msg.edit_text("❌ Download failed: " + str(e))
+        return
 
     # re-encode if >50MB
     try:
         size = os.path.getsize(file_path)
         if size > MAX_VIDEO_BYTES:
-            await info_msg.edit_text("Video >50MB — reencoding...")
-            dst = str(Path(file_path).with_name(Path(file_path).stem+"_small.mp4"))
+            await info_msg.edit_text("Video >50MB — reencoding (fast)...")
+            dst = str(Path(file_path).with_name(Path(file_path).stem + "_small.mp4"))
             try:
-                await asyncio.to_thread(reencode_to_target_size_singlepass, file_path, dst, MAX_VIDEO_BYTES-1024*1024)
+                await asyncio.to_thread(reencode_to_target_size_singlepass, file_path, dst, MAX_VIDEO_BYTES - 1024 * 1024)
                 send_path = dst
             except Exception as e:
+                logger.warning("Reencode failed: %s", e)
                 send_path = file_path
         else:
             send_path = file_path
 
-        await msg.reply_video(send_path, caption=info.get("title",""))
-    except:
-        await msg.reply_text("Failed to send video.")
+        await msg.reply_video(send_path, caption=info.get("title", ""))
+    except Exception as e:
+        await msg.reply_text("Failed to send video: " + str(e))
     finally:
-        try: os.remove(file_path)
-        except: pass
+        try:
+            os.remove(file_path)
+        except:
+            pass
         try:
             if 'dst' in locals() and os.path.exists(dst):
                 os.remove(dst)
-        except: pass
+        except:
+            pass
         await info_msg.delete()
 
 
 # ---------------- YT PLAYLIST ----------------
 @app.on_message(filters.command("ytpl"))
 async def ytpl_handler(cli, msg):
-    if not is_authorized(msg.from_user.id):
+    uid = msg.from_user.id if msg.from_user else None
+    if not is_authorized(uid):
         return await msg.reply_text("🚫 Unauthorized.")
 
     await msg.reply_text("📄 Send playlist link:")
     m = await app.listen(msg.chat.id, timeout=180)
+    if not m or not getattr(m, "text", None):
+        return await msg.reply_text("No link received. Cancelled.")
     url = m.text.strip()
 
     fut = asyncio.get_event_loop().create_future()
@@ -316,7 +343,8 @@ async def ytpl_handler(cli, msg):
 
     try:
         req_height = await asyncio.wait_for(fut, timeout=60)
-    except:
+    except Exception:
+        PENDING_QUALITY.pop(msg.chat.id, None)
         return await msg.reply_text("No quality selected.")
     finally:
         PENDING_QUALITY.pop(msg.chat.id, None)
@@ -325,7 +353,7 @@ async def ytpl_handler(cli, msg):
     try:
         videos = extract_playlist_items(url)
     except Exception as e:
-        return await status.edit_text("❌ Failed: "+str(e))
+        return await status.edit_text("❌ Failed: " + str(e))
 
     await status.edit_text(f"Found {len(videos)} videos. Starting...")
 
@@ -336,25 +364,29 @@ async def ytpl_handler(cli, msg):
             size = os.path.getsize(file_path)
 
             if size > MAX_VIDEO_BYTES:
-                dst = str(Path(file_path).with_name(Path(file_path).stem+"_small.mp4"))
+                dst = str(Path(file_path).with_name(Path(file_path).stem + "_small.mp4"))
                 try:
-                    await asyncio.to_thread(reencode_to_target_size_singlepass, file_path, dst, MAX_VIDEO_BYTES-1024*1024)
+                    await asyncio.to_thread(reencode_to_target_size_singlepass, file_path, dst, MAX_VIDEO_BYTES - 1024 * 1024)
                     send_path = dst
-                except:
+                except Exception as e:
+                    logger.warning("Reencode failed: %s", e)
                     send_path = file_path
             else:
                 send_path = file_path
 
-            await msg.reply_video(send_path, caption=f"{idx}/{len(videos)} – {info.get('title','')}")
+            await msg.reply_video(send_path, caption=f"{idx}/{len(videos)} – {info.get('title', '')}")
         except Exception as e:
             await msg.reply_text(f"Failed ({idx}): {e}")
         finally:
-            try: os.remove(file_path)
-            except: pass
+            try:
+                os.remove(file_path)
+            except:
+                pass
             try:
                 if 'dst' in locals() and os.path.exists(dst):
                     os.remove(dst)
-            except: pass
+            except:
+                pass
             await s.delete()
             await asyncio.sleep(1)
 
@@ -390,26 +422,34 @@ async def sudo_handler(cli, msg):
         await msg.reply_text("Invalid action.")
 
 
-
 # ---------------- MAIN START ----------------
 def start():
-    run_web()
+    # start web (health) server thread first
+    try:
+        run_web()
+    except Exception:
+        logger.warning("run_web failed or already running.")
     logger.info("Starting bot...")
     app.run()
 
 
 if __name__ == "__main__":
-    missing=[]
-    if API_ID==0: missing.append("API_ID")
-    if not API_HASH: missing.append("API_HASH")
-    if not BOT_TOKEN: missing.append("BOT_TOKEN")
-    if OWNER_ID==0: missing.append("OWNER_ID")
+    missing = []
+    if API_ID == 0:
+        missing.append("API_ID")
+    if not API_HASH:
+        missing.append("API_HASH")
+    if not BOT_TOKEN:
+        missing.append("BOT_TOKEN")
+    if OWNER_ID == 0:
+        missing.append("OWNER_ID")
 
     if missing:
-        print("Missing:",missing)
-        raise SystemExit
+        print("Missing:", missing)
+        raise SystemExit(1)
 
     try:
         start()
     finally:
         shutil.rmtree(TMP_DIR, ignore_errors=True)
+                    
