@@ -1,0 +1,10 @@
+pyrogram==2.0.106
+tgcrypto
+yt-dlp
+aiohttp
+aiofiles
+pyromod==1.0.8
+uvicorn
+fastapi
+python-dotenv
+pytube
