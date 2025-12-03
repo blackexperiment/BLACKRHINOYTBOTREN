@@ -97,38 +97,47 @@ async def send_photo_via_url_or_upload(bot, chat_id, url, caption=None, reply_ma
 
 # --- YT Download helpers ---
 def download_video_with_ydl(url: str, outdir: str, fmt: str = "best"):
-    """
-    Returns path to downloaded file (or raises)
-    fmt: yt-dlp format selector, e.g. "best[height<=720]" or "best"
-    """
-    # sanitize output template
     outtmpl = os.path.join(outdir, "%(title)s.%(ext)s")
+
     ydl_opts = {
         "format": fmt,
         "outtmpl": outtmpl,
         "noplaylist": True,
         "quiet": True,
         "no_warnings": True,
-        # "progress_hooks": [progress_hook],
     }
+
+    # Add cookies if available
+    cookies_path = os.getenv("COOKIES_FILE_PATH")
+    if cookies_path and os.path.exists(cookies_path):
+        ydl_opts["cookiefile"] = cookies_path
+        logger.info(f"Using cookies file: {cookies_path}")
+    else:
+        logger.warning("No cookies file found; login-required videos may fail.")
+
     with YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=True)
-        # build filename
+
         ext = info.get("ext") or "mp4"
         title = info.get("title") or "video"
         filename = os.path.join(outdir, f"{title}.{ext}")
-        # Some yt-dlp returns path in info.get('_filename')
+
         possible = info.get("_filename")
         if possible and os.path.exists(possible):
             return possible
-        # fallback: try to find matching file
+
         if os.path.exists(filename):
             return filename
-        # as fallback search outdir for newest file
-        files = sorted([os.path.join(outdir, f) for f in os.listdir(outdir)], key=os.path.getmtime, reverse=True)
+
+        files = sorted(
+            [os.path.join(outdir, f) for f in os.listdir(outdir)],
+            key=os.path.getmtime,
+            reverse=True
+        )
         if files:
             return files[0]
-        raise FileNotFoundError("Downloaded file not found after yt-dlp")
+
+        raise FileNotFoundError("Downloaded file not found.")
 
 def extract_playlist_items(url: str):
     ydl_opts = {"quiet": True, "extract_flat": True}
@@ -321,3 +330,4 @@ if __name__ == "__main__":
             shutil.rmtree(TMP_DIR)
         except:
             pass
+
